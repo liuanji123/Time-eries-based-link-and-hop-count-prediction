@@ -52,7 +52,7 @@ def process_data_from_file(file_path, seq_len, batch_size):
     data['起始点'], start_labels = pd.factorize(data['起始点'])
     data['终止点'], end_labels = pd.factorize(data['终止点'])
     num_nodes = len(start_labels)
-    print(f"num_nodes: {num_nodes}")
+    # print(f"num_nodes: {num_nodes}")
     # 初始化变量
     graphs = []
 
@@ -73,13 +73,10 @@ def process_data_from_file(file_path, seq_len, batch_size):
     for i in range(len(graphs) - seq_len):
         # 获取每一个时间步的图数据
         seq_graphs = graphs[i:i + seq_len]
-
         # 这里保留每个时间步图的节点特征
         x = torch.stack([g.x for g in seq_graphs], dim=0)  # (seq_len, num_nodes, feature_dim)
-
         # 每个时间步的边信息都保留独立，注意我们直接保留每个时间步的 edge_index 和 edge_attr
         edge_indices = [g.edge_index for g in seq_graphs]  # (seq_len, num_edges, 2)
-        print(edge_indices[0].shape) # list(2 * 80) 8个元素
         edge_weights = [g.edge_attr for g in seq_graphs]  # (seq_len, num_edges)
 
         samples.append((x, edge_indices, edge_weights)) # (1440 - 8) * ()
@@ -92,31 +89,42 @@ def process_data_from_file(file_path, seq_len, batch_size):
     test_loader = DataLoader(test_samples, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader, num_nodes
 
+
 # 定义GCN模型用于时间序列链接预测和跳数预测
 class GNNRoutingModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_nodes):
         super(GNNRoutingModel, self).__init__()
         self.num_nodes = num_nodes  # 将 num_nodes 存储为类的属性
         # 两个卷积层用于提取拓扑特征
+        self.gat1 = GATConv(input_dim, hidden_dim, heads=4, concat=True)
+        self.gat2 = GATConv(hidden_dim * 4, output_dim, heads=1, concat=False)
+        self.dropout = nn.Dropout(p=0.5)
+
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         # 链路预测的全连接层
         self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)  # 结合高阶和低阶特征
         self.fc2 = nn.Linear(hidden_dim, output_dim)  # 链路预测输出
         # 跳数预测的全连接层
-        self.fc_hop = nn.Linear(hidden_dim * 2, num_nodes * num_nodes)  # 调整输出维度
+        self.fc_hop = nn.Linear(hidden_dim * 2, num_nodes)  # 调整输出维度
 
-    def forward(self, data):
-        print("x shape",data.x.shape)
+    def encode(self, x, edge_index):
+        x = x.view(-1, x.size(-1))
+        x = self.gat1(x, edge_index).relu()
+        x = self.dropout(x)
+        x = self.gat2(x, edge_index)
+        return x
+
+    def decode(self, z, edge_label_index):
+        src, dst = z[edge_label_index[0]], z[edge_label_index[1]]
+        return (src * dst).sum(dim=-1)
+
+    def forward(self, data, edge_label_index):
         seq_len = data.x.size(0)  # 获取序列长度
-        # batch_size = data.x.size(1)  # 获取批量大小
-        num_nodes = self.num_nodes  # 获取节点数
 
         x = data.x  # (seq_len, num_nodes, feature_dim)
         edge_indices = data.edge_index  # (seq_len, num_edges, 2)
         edge_weights = data.edge_attr  # (seq_len, num_edges)
-
-        print(f"x.shape: {x.shape}")  # 应该是 (seq_len, num_nodes, feature_dim)
 
         # 初始化输出
         link_out = []
@@ -124,41 +132,39 @@ class GNNRoutingModel(nn.Module):
 
         # 对每个时间步的图分别进行卷积操作
         for t in range(seq_len):
-            print(f"x[{t}].shape: {x[t].shape}")  # 打印每个时间步的数据形状
-            print(f"x[t]: {x[t]}")
-            x_t = x[t].view(1, -1)  # 将 x[t] 调整为二维张量 (num_nodes, feature_dim)
-            print(f"x_t shape after view: {x_t.shape}")  # 打印调整后的 x_t 的形状
-            edge_index = edge_indices[t]
+            x_t = x[t]  # 将 x[t] 调整为二维张量 (num_nodes, feature_dim)
+            edge_index_hop = edge_indices[t]
             edge_attr = edge_weights[t]
-            print(edge_index.shape, edge_attr.shape)
+            # print(edge_index.shape, edge_attr.shape)
 
             # 图卷积操作
-            x_low = F.relu(self.conv1(x_t, edge_index, edge_attr))
-            x_low = F.relu(self.conv2(x_low, edge_index, edge_attr))
+            x_low = F.relu(self.conv1(x_t, edge_index_hop, edge_attr))
+            x_low = F.relu(self.conv2(x_low, edge_index_hop, edge_attr))
 
-            x_high = F.relu(self.conv1(x_t, edge_index, edge_attr))
-            x_high = F.relu(self.conv2(x_high, edge_index, edge_attr))
+            x_high = F.relu(self.conv1(x_t, edge_index_hop, edge_attr))
+            x_high = F.relu(self.conv2(x_high, edge_index_hop, edge_attr))
 
             # 特征交叉
             x_combined = torch.cat([x_low, x_high], dim=-1)  # 通过拼接交叉特征
 
             # 链路预测
-            link_pred = F.relu(self.fc1(x_combined))
-            link_out.append(self.fc2(link_pred))  # 每个时间步的链路预测输出
+            # link_pred = F.relu(self.fc1(x_combined))
+            # link_out.append(self.fc2(link_pred))  # 每个时间步的链路预测输出
 
             # 跳数预测
             hop_out.append(self.fc_hop(x_combined))  # 每个时间步的跳数预测输出
 
-        # # 聚合每个时间步的预测输出（例如，取平均）
+        edge_index_permuted = data.edge_index.permute(1, 0, 2)  # 通过 permute 交换维度顺序为 [2, 8, 80]
+        edge_index_flattened = edge_index_permuted.reshape(2, -1)  # 将 [8, 80] 展平为 [640]，保留第一个维度
+
+        # 链路预测
+        z = self.encode(x, edge_index_flattened)
+        link_pred = self.decode(z, edge_label_index)
+
         # link_out = torch.stack(link_out, dim=0)  # (seq_len, num_nodes, num_nodes)
-        # hop_out = torch.stack(hop_out, dim=0)  # (seq_len, num_nodes, num_nodes)
-        # print(f"hop_out shape before reshaping: {hop_out.shape}")  # 打印检查 hop_out 的形状
-        # print(f"num_nodes: {num_nodes}")  # 打印检查 hop_out 的形状
+        hop_out = torch.stack(hop_out, dim=0)  # (seq_len, num_nodes, num_nodes)
 
-        # hop_out = hop_out.view(seq_len, batch_size, num_nodes, num_nodes)  # (seq_len, batch_size, num_nodes, num_nodes)
-        # print(f"hop_out shape after reshaping: {hop_out.shape}")  # 打印检查 reshaped hop_out 的形状
-
-        return link_out, hop_out
+        return link_pred, hop_out
 
 
 # 定义 Dijkstra 函数以计算最短路径和跳数
@@ -168,53 +174,90 @@ def dijkstra_shortest_hops(graph, source_node):
     return lengths
 
 
-# 计算跳数的函数
+# 计算跳数标签的函数
 def calculate_hops(graphs, seq_len):
-    hop_targets = []
+    hop_targets = []  # 用于存储所有时间步的跳数标签
 
-    for t in range(seq_len):  # seq_len 时间步
+    # 遍历每个时间步
+    for t in range(seq_len):
         graph_t = graphs[t]  # 选择第 t 个时间步的图数据
-        print(f"graph_t.num_nodes: {graph_t.num_nodes}")
+        # 创建一个零矩阵来保存该时间步所有节点对的跳数
+        hop_matrix = torch.zeros((graph_t.num_nodes, graph_t.num_nodes), dtype=torch.float)
 
-        # 对每个时间步，计算每个节点对的跳数
+        # 对每个时间步的每个节点，计算跳数
         for source_node in range(graph_t.num_nodes):
+            # 获取从源节点到所有其他节点的最短路径
             lengths = dijkstra_shortest_hops(graph_t, source_node)
-            for target_node in range(graph_t.num_nodes):
-                hop_targets.append(lengths.get(target_node, float('inf')))
 
-    return torch.tensor(hop_targets, dtype=torch.float)
+            # 对于每个目标节点，获取跳数（若没有路径，设为inf）
+            for target_node in range(graph_t.num_nodes):
+                hop_matrix[source_node, target_node] = lengths.get(target_node, float('inf'))
+
+        hop_targets.append(hop_matrix)  # 将当前时间步的跳数矩阵添加到列表中
+
+    # 将列表中的跳数矩阵堆叠成一个三维张量
+    return torch.stack(hop_targets, dim=0)  # 返回形状为 (seq_len, num_nodes, num_nodes) 的三维张量
 
 
 # 计算负量采样
-def negative_sample(data, neg_ratio=3):
-    num_pos_samples = data.edge_index.size(1)
-    num_neg_samples = num_pos_samples * neg_ratio
+def negative_sample(data, neg_ratio= 3):
+    edge_index_permuted = data.edge_index.permute(1, 0, 2)  # 通过 permute 交换维度顺序为 [2, 8, 80]
+    edge_index_flattened = edge_index_permuted.reshape(2, -1)  # 将 [8, 80] 展平为 [640]，保留第一个维度
+    edge_index_flattened = edge_index_flattened.long()
+    num_neg_samples = edge_index_flattened.size(1)
+    # 正负采样按照一个比例 neg_ratio=3
+    # num_pos_samples = edge_index_flattened.size(1)
+    # num_neg_samples = num_pos_samples * neg_ratio
 
-    # 如果 edge_index 是三维的, 遍历每个时间步
-    edge_label_index_list = []
-    for t in range(data.edge_index.size(0)):  # 如果数据包含多个时间步
-        edge_index = data.edge_index[t]  # 选择第 t 个时间步的边
-
-        # 确保 edge_index 是二维的
-        if edge_index.dim() == 1:
-            # 如果是 1D 的，手动调整为 2D
-            edge_index = edge_index.unsqueeze(0)  # 在第一维加一维，使其成为 2D
-            edge_index = edge_index.repeat(2, 1)  # 重复两次使其符合 edge_index 的形状
-
-        assert edge_index.dim() == 2, f"edge_index should be 2D, but got {edge_index.dim()}D"
-
-        neg_edge_index = negative_sampling(
-            edge_index, num_nodes=data.num_nodes,
-            num_neg_samples=num_neg_samples, method='sparse'
-        )
-        edge_label_index_list.append(torch.cat([edge_index, neg_edge_index], dim=-1).long())
-
-    edge_label_index = torch.cat(edge_label_index_list, dim=-1)
-    edge_label = torch.cat([torch.ones(num_pos_samples), torch.zeros(num_neg_samples)], dim=0)
+    neg_edge_index = negative_sampling(
+        edge_index=edge_index_flattened, num_nodes=data.x.size(1),
+        num_neg_samples=num_neg_samples, method='sparse'
+    )
+    edge_label_index = torch.cat([edge_index_flattened, neg_edge_index], dim=-1).long()
+    edge_label = torch.cat([torch.ones(num_neg_samples), torch.zeros(neg_edge_index.size(1))], dim=0)
     perm = torch.randperm(edge_label.size(0))
     edge_label = edge_label[perm]
+
     edge_label_index = edge_label_index[:, perm]
     return edge_label, edge_label_index
+
+
+    # num_pos_samples = data.edge_index.size(1)
+    # print(f'num_pos_samples : {num_pos_samples} ')
+    # num_neg_samples = num_pos_samples * neg_ratio
+    #
+    # # edge_index 是三维的(seq_len, num_edges, 2), 遍历每个时间步
+    # edge_label_index_list = []
+    # for t in range(data.edge_index.size(0)):  # 如果数据包含多个时间步
+    #     edge_index = data.edge_index[t]  # 选择第 t 个时间步的边
+    #
+    #     neg_edge_index = negative_sampling(
+    #         edge_index, num_nodes=data.num_nodes,
+    #         num_neg_samples=num_neg_samples, method='sparse'
+    #     )
+    #     edge_label_index_list.append(torch.cat([edge_index, neg_edge_index], dim=-1).long())
+    #
+    # edge_label_index = torch.cat(edge_label_index_list, dim=-1)
+    # edge_label = torch.cat([torch.ones(num_pos_samples), torch.zeros(num_neg_samples)], dim=0)
+    # perm = torch.randperm(edge_label.size(0))
+    # edge_label = edge_label[perm]
+    # edge_label_index = edge_label_index[:, perm]
+    # return edge_label, edge_label_index
+
+# 保存模型的训练结果
+def save_model(model, file_path):
+    torch.save(model.state_dict(), file_path)
+    print(f"Model saved to {file_path}")
+
+
+# 加载保存的模型
+def load_model(model, file_path):
+    if os.path.exists(file_path):
+        model.load_state_dict(torch.load(file_path))
+        model.eval()  # 切换到评估模式
+        print(f"Model loaded from {file_path}")
+    else:
+        print(f"No saved model found at {file_path}. Proceeding with an untrained model.")
 
 
 def train_model():
@@ -232,7 +275,6 @@ def train_model():
     # 构建时间序列数据集
     train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_all.csv', args.seq_len,
                                                                   args.batch_size)
-    print(f"Number of nodes: {num_nodes}")
     model = GNNRoutingModel(input_dim=args.input_size,
                             hidden_dim=args.hidden_size,
                             output_dim=args.output_size,
@@ -240,139 +282,179 @@ def train_model():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
-    criterion_link = nn.MSELoss()
+    criterion_link = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.5]).to(device)) # 这个很有用吗？
+
     criterion_hop = nn.MSELoss()  # 跳数预测的损失函数
-    print(f"Model initialized with num_nodes: {model.num_nodes}")
-    for epoch in range(25):
+    for epoch in range(30):
         print(f"Epoch {epoch + 1}, num_nodes: {num_nodes}")
         model.train()
         epoch_loss = 0
-
+        epoch_link_loss = 0
+        epoch_hop_loss = 0
         for x, edge_indices, edge_weights in train_loader:
             optimizer.zero_grad()
-
-            print(f"x.shape: {x.shape}")  # 应该是 (batch_size, seq_len, num_nodes, feature_dim)
-            print(f"edge index.shape: {edge_indices[0].shape}")  
 
             batch_size = x.shape[0]
             seq_len = x.shape[1]  # 序列长度
             num_nodes = x.shape[2]  # 节点数量
-            feature_dim = x.shape[3]  # 特征维度
-
-
+            losses_link_per_batch = []
+            losses_hop_per_batch = []
             losses_per_batch = []
             for i in range(batch_size):
                 hop_targets = []  # 每个批次开始时初始化 hop_targets
-                # graphs = []  # 用于保存每个时间步的图数据
-                edge_index_new = []
-                edge_weights_new = []
-                x_new = []
+
+                graphs = []  # 用于保存每个时间步的图数据
+                edge_index_tot = []
+                edge_weight_tot = []
+                x_tot = []
                 for t in range(seq_len):  # seq_len
                     edge_index = edge_indices[t][i]  # 获取第 t 个时间步的边
-                    print(f"edge_index shape at time step {t}: {edge_index.shape}")
-                    # data = Data(x=x[i, t].view(-1, x.size(-1)).to(device),  # 获取第t个时间步的节点特征
-                    #             edge_index=edge_indices[t][i].to(device),  # 获取第t个时间步的边
-                    #             edge_attr=edge_weights[t][i].to(device))  # 获取第t个时间步的边权重
-                    edge_index_new.append(edge_indices[t][i])
-                    edge_weights_new.append(edge_weights[t][i])
-                    x_new.append(x[i, t].view(-1, x.size(-1)))
-                    # graphs.append(data)  # 将每个时间步的图数据保存到 graphs 中
-                # 计算跳数
-                # 转成tensor
-                data = Data(x_new, edge_weights_new, edge_index_new)  # 获取第t个时间步的边权重
-                hop_targets.append(calculate_hops(data, seq_len=args.seq_len))
+                    data = Data(x=x[i, t].view(-1, x.size(-1)).to(device),  # 获取第t个时间步的节点特征
+                                edge_index=edge_indices[t][i].to(device),  # 获取第t个时间步的边
+                                edge_attr=edge_weights[t][i].to(device))  # 获取第t个时间步的边权重
+                    edge_index_tot.append(edge_indices[t][i].to(device))
+                    edge_weight_tot.append(edge_weights[t][i].to(device))
+                    x_tot.append(x[i, t].view(-1, x.size(-1)).to(device))
+                    graphs.append(data)  # 将每个时间步的图数据保存到 graphs 中
 
-                hop_targets = torch.stack(hop_targets, dim=0)  # 将跳数按时间步堆叠
+                # 将列表转换为张量
+                x_tot = torch.stack(x_tot, dim=0)  # 将所有时间步的节点特征堆叠为一个张量，形状为 (seq_len, num_nodes, feature_dim)
+                edge_index_tot = torch.stack(edge_index_tot, dim=0)  # 将所有时间步的边索引堆叠为一个张量，形状为 (seq_len, num_edges, 2)
+                edge_weight_tot = torch.stack(edge_weight_tot, dim=0)  # 将所有时间步的边权重堆叠为一个张量，形状为 (seq_len, num_edges)
 
+                # 创建图数据
+                data = Data(x=x_tot, edge_index=edge_index_tot, edge_attr=edge_weight_tot)
+
+                # 跳数标签
+                hop_targets.append(calculate_hops(graphs, seq_len=args.seq_len).to(device))
+                # 链路标签
                 edge_label, edge_label_index = negative_sample(data)
-
                 edge_label, edge_label_index = edge_label.to(device), edge_label_index.to(device)
 
                 # 前向传播
-                link_pred, hop_pred = model(data)
+                link_pred, hop_pred = model(data, edge_label_index)
 
                 loss_link = criterion_link(link_pred, edge_label)
+                losses_link_per_batch.append(loss_link)
 
-                print(f"hop_pred shape: {hop_pred.shape}")
-                print(f"hop_targets shape: {hop_targets.shape}")
+            # 单独计算链路预测的损失
+            batch_link_loss = sum(losses_link_per_batch) / len(losses_link_per_batch)
+            epoch_link_loss += batch_link_loss.item()
 
-                loss_hop = criterion_hop(hop_pred.squeeze(), hop_targets)
+            # 单独计算跳数预测的损失
+            hop_targets = torch.stack(hop_targets, dim=0)  # 将跳数按时间步堆叠
+            loss_hop = criterion_hop(hop_pred.squeeze(), hop_targets)
+            losses_hop_per_batch.append(loss_hop)
+            batch_hop_loss = sum(losses_hop_per_batch) / len(losses_hop_per_batch)
+            epoch_hop_loss += batch_hop_loss.item()
 
-                # 总损失
-                loss = loss_link + loss_hop
-                losses_per_batch.append(loss)
-
+            # 总损失
+            loss = loss_link * 4 + loss_hop
+            losses_per_batch.append(loss)
+            print("loss-----------------------------", loss)
             # 计算当前 batch 的平均 loss
-            if len(losses_per_batch) > 0:
-                batch_loss = sum(losses_per_batch) / len(losses_per_batch)
-                batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度剪裁
-                optimizer.step()
+            batch_loss = sum(losses_per_batch) / len(losses_per_batch)
+            batch_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度剪裁
+            optimizer.step()
+            epoch_loss += batch_loss.item()
 
-                epoch_loss += batch_loss.item()
 
-        if len(losses_per_batch) > 0:
-            losses.append(epoch_loss / len(train_loader))
-            print(f'Epoch {epoch + 1}, Loss: {epoch_loss / len(train_loader)}')
+        losses.append(epoch_link_loss / len(train_loader))
+        print(f'Epoch {epoch + 1}, link_Loss: {epoch_link_loss / len(train_loader)}')
+        losses.append(epoch_hop_loss / len(train_loader))
+        print(f'Epoch {epoch + 1}, hop_Loss: {epoch_hop_loss / len(train_loader)}')
+        losses.append(epoch_loss / len(train_loader))
+        print(f'Epoch {epoch + 1}, all_Loss: {epoch_loss / len(train_loader)}')
 
-            # 调整学习率
-            scheduler.step(epoch_loss / len(train_loader))
+        # 调整学习率
+        scheduler.step(epoch_loss / len(train_loader))
 
-    # 绘制损失值变化图
+    # 保存训练后的模型
+    # save_model(model, "./data/trained_model.pth")
+    #     # 绘制损失值变化图
     plot_loss(losses)
 
     # 在测试集上进行评估
     test(model, test_loader)
 
-    # 链路预测评估
-    evaluate_model(model)
-
 
 # 测试函数定义
-
 def test(model, test_loader):
+    # 加载模型
+    # load_model(model, "./data/trained_model.pth")
     model.eval()
-    all_preds = []
-    all_labels = []
+    all_link_preds = []
+    all_link_labels = []
+    all_hop_preds = []
+    all_hop_labels = []
     with torch.no_grad():
         for x, edge_indices, edge_weights in test_loader:
+
             batch_size = x.shape[0]
+            seq_len = x.shape[1]  # 序列长度
+            num_nodes = x.shape[2]  # 节点数量
+
+            losses_per_batch = []
             for i in range(batch_size):
-                data = Data(x=x[i].view(-1, x.size(-1)).to(device), edge_index=edge_indices[i].to(device),
-                            edge_attr=edge_weights[i].to(device))
+
+                hop_targets = []  # 每个批次开始时初始化 hop_targets
+                graphs = []  # 用于保存每个时间步的图数据
+                edge_index_tot = []
+                edge_weight_tot = []
+                x_tot = []
+                for t in range(seq_len):  # seq_len
+                    edge_index = edge_indices[t][i]  # 获取第 t 个时间步的边
+                    data = Data(x=x[i, t].view(-1, x.size(-1)).to(device),  # 获取第t个时间步的节点特征
+                                edge_index=edge_indices[t][i].to(device),  # 获取第t个时间步的边
+                                edge_attr=edge_weights[t][i].to(device))  # 获取第t个时间步的边权重
+                    edge_index_tot.append(edge_indices[t][i].to(device))
+                    edge_weight_tot.append(edge_weights[t][i].to(device))
+                    x_tot.append(x[i, t].view(-1, x.size(-1)).to(device))
+                    graphs.append(data)  # 将每个时间步的图数据保存到 graphs 中
+
+                # 将列表转换为张量
+                x_tot = torch.stack(x_tot, dim=0)  # 将所有时间步的节点特征堆叠为一个张量，形状为 (seq_len, num_nodes, feature_dim)
+                edge_index_tot = torch.stack(edge_index_tot, dim=0)  # 将所有时间步的边索引堆叠为一个张量，形状为 (seq_len, num_edges, 2)
+                edge_weight_tot = torch.stack(edge_weight_tot, dim=0)  # 将所有时间步的边权重堆叠为一个张量，形状为 (seq_len, num_edges)
+
+                # 创建图数据
+                data = Data(x=x_tot, edge_index=edge_index_tot, edge_attr=edge_weight_tot)
+
+                hop_targets.append(calculate_hops(graphs, seq_len).to(device))
+
                 edge_label, edge_label_index = negative_sample(data)
                 edge_label, edge_label_index = edge_label.to(device), edge_label_index.to(device)
-                pred = model(data.x, data.edge_index, edge_label_index).view(-1).sigmoid()
-                all_preds.append(pred.cpu().numpy())
-                all_labels.append(edge_label.cpu().numpy())
-    # 计算 AUC
-    auc = roc_auc_score(np.concatenate(all_labels), np.concatenate(all_preds))
-    print(f'Test AUC: {auc}')
+                # print(f"edge_label: {edge_label}")
 
+                link_pred, hop_pred = model(data, edge_label_index)
+                all_link_preds.append(link_pred.cpu().numpy())
+                all_link_labels.append(edge_label.cpu().numpy())
 
-def evaluate_model(model):
-    model.eval()
-    y_true = []
-    y_pred = []
+            hop_targets = torch.stack(hop_targets, dim=0)  # 将跳数按时间步堆叠
+            all_hop_preds.append(hop_pred.cpu().numpy())
+            all_hop_labels.append(hop_targets.cpu().numpy())
 
-    with torch.no_grad():
-        for data in test_loader:
-            data = data.to(device)
-            link_out, hop_out = model(data)
+    print(f"Shape of all_link_preds: {np.array(all_link_preds).shape}")
+    print(f"Shape of all_link_labels.shape: {np.array(all_link_labels).shape}")
+    print(f"Shape of all_link_labels: {np.array(all_link_labels)}")
 
-            edge_label, edge_label_index = negative_sample(data)
-            y_true.append(edge_label.cpu().numpy())
-            y_pred.append(link_out[edge_label_index[0], edge_label_index[1]].cpu().numpy())
+    print(f"Shape of all_hop_preds: {np.array(all_hop_preds).shape}")
+    print(f"Shape of all_hop_labels: {np.array(all_hop_labels).shape}")
 
-    y_true = np.concatenate(y_true)
-    y_pred = np.concatenate(y_pred)
+    # 对于每个时间步，计算 AUC
+    hop_preds_flat = np.concatenate([pred.flatten() for pred in all_hop_preds], axis=0)  # 展平所有预测
+    hop_labels_flat = np.concatenate([label.flatten() for label in all_hop_labels], axis=0)  # 展平所有标签
 
-    # ROC-AUC和平均精度
-    roc_auc = roc_auc_score(y_true, y_pred)
-    avg_precision = average_precision_score(y_true, y_pred)
+    print(f"hop_preds_flat shape: {hop_preds_flat.shape}")
+    print(f"hop_labels_flat shape: {hop_labels_flat.shape}")
 
-    print(f"ROC AUC: {roc_auc:.4f}")
-    print(f"Average Precision: {avg_precision:.4f}")
+    auc_link = roc_auc_score(np.concatenate(all_link_labels), np.concatenate(all_link_preds))
+    # auc_link = roc_auc_score(link_labels_flat, link_preds_flat)
+    mse_hop = mean_squared_error(hop_labels_flat, hop_preds_flat)
+
+    print(f'Test link AUC: {auc_link}')
+    print(f'Test hop mean: {mse_hop}')
 
 
 # 使用 Dijkstra 算法进行所有节点到所有节点的路径预测
@@ -482,9 +564,9 @@ def compare_routing_accuracy(model, data):
     accuracy = correct_count / total_count if total_count > 0 else 0
     print(f'GNN 路径预测的准确度: {accuracy * 100:.2f}%')
 
-# 训练并预测
-train_model()
-train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_all.csv', 8, 32)
-for x, edge_indices, edge_weights in test_loader:
-    data = Data(x=x[0].view(-1, x.size(-1)).to(device), edge_index=edge_indices[0].to(device), edge_attr=edge_weights[0].to(device))
-    compare_routing_accuracy(GNNRoutingModel(2, 256, 1).to(device), data)
+if __name__ == "__main__":
+    train_model()
+    train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_all.csv', 8, 32)
+    for x, edge_indices, edge_weights in test_loader:
+        data = Data(x=x[0].view(-1, x.size(-1)).to(device), edge_index=edge_indices[0].to(device), edge_attr=edge_weights[0].to(device))
+        compare_routing_accuracy(GNNRoutingModel(2, 256, 1, num_nodes).to(device), data)
