@@ -250,6 +250,48 @@ def dijkstra_all_pairs(data):
 
     return all_hops
 
+def dijkstra_all_pairs_with_paths_weighted(data):
+    num_nodes = data.x.size(0)
+
+    edge_index = data.edge_index  # 边索引，形状为 [2, num_edges]
+    edge_attr = data.edge_attr  # 边属性（权重），形状为 [num_edges]
+
+    # 创建邻接表以表示图
+    adj_list = {i: [] for i in range(num_nodes)}
+    for i in range(edge_index.size(1)):
+        start_node = edge_index[0, i].item()
+        end_node = edge_index[1, i].item()
+        weight = edge_attr[i].item()
+        adj_list[start_node].append((end_node, weight))
+        adj_list[end_node].append((start_node, weight))  # 如果是无向图
+
+    # 初始化距离矩阵和路径矩阵
+    all_distances = torch.full((num_nodes, num_nodes), float('inf'), dtype=torch.float)
+    all_paths = [[[] for _ in range(num_nodes)] for _ in range(num_nodes)]  # 存储路径信息
+
+    for start_node in range(num_nodes):
+        visited = [False] * num_nodes
+        min_heap = [(0, start_node, [start_node])]  # (当前距离, 当前节点, 当前路径)
+        all_distances[start_node, start_node] = 0
+        all_paths[start_node][start_node] = [start_node]
+
+        while min_heap:
+            current_distance, current_node, path = heapq.heappop(min_heap)
+            if visited[current_node]:
+                continue
+            visited[current_node] = True
+
+            for neighbor, weight in adj_list[current_node]:
+                if not visited[neighbor]:
+                    new_distance = current_distance + weight
+                    if new_distance < all_distances[start_node, neighbor]:
+                        all_distances[start_node, neighbor] = new_distance
+                        new_path = path + [neighbor]
+                        all_paths[start_node][neighbor] = new_path
+                        heapq.heappush(min_heap, (new_distance, neighbor, new_path))
+
+    return all_distances, all_paths
+
 
 # 比较 GNN 和 Dijkstra 的最短路径预测
 def predict_all_pairs_routing_with_cache(model, data):
@@ -319,7 +361,7 @@ def compare_routing_accuracy(model, data):
 
     # Dijkstra 路径预测
     start_time_dijkstra = time.time()
-    dijkstra_paths = dijkstra_all_pairs(data)
+    _, dij_paths = dijkstra_all_pairs_with_paths_weighted(data)
     end_time_dijkstra = time.time()
     print(f'Dijkstra 所有节点到所有节点路径预测时间: {end_time_dijkstra - start_time_dijkstra} 秒')
 
@@ -330,15 +372,14 @@ def compare_routing_accuracy(model, data):
 
     for start_node in range(num_nodes):
         for target_node in range(num_nodes):
-            dijkstra_hop_count = dijkstra_paths[start_node, target_node].item()
-            if dijkstra_hop_count == float('inf'):
-                continue  # 忽略无路径的节点对
+            path = dij_paths[start_node, target_node]
 
             gnn_path = gnn_paths.get((start_node, target_node), None)
-            if gnn_path is not None:
                 # 判断 GNN 预测的路径长度是否与 Dijkstra 一致
-                if len(gnn_path) - 1 == dijkstra_hop_count:
-                    correct_count += 1
+                # if len(gnn_path) - 1 == dijkstra_hop_count:
+                #     correct_count += 1
+            if path == gnn_path:
+                correct_count += 1
             total_count += 1
 
     accuracy = correct_count / total_count if total_count > 0 else 0
@@ -346,6 +387,3 @@ def compare_routing_accuracy(model, data):
 
 if __name__ == "__main__":
     train_model()
-
-
-
