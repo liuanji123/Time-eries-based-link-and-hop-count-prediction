@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -137,14 +139,14 @@ def train_model():
         input_size = 3
         hidden_size = 256
         output_size = 1
-        epochs = 1
+        epochs = 20
         learning_rate = 0.001  # 调整学习率
         weight_decay = 1e-3  # 添加权重衰减防止过拟合
 
     args = Args()
 
     # 构建时间序列数据集
-    train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_all.csv')
+    train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_test.csv')
     model = GNNRoutingModel(input_dim=args.input_size,
                             hidden_dim=args.hidden_size)
 
@@ -173,6 +175,9 @@ def train_model():
 
     # 绘制损失值变化图
     plot_loss(losses)
+
+    # 保存模型
+    torch.save(model.state_dict(), './data/gnn_routing_model.pth')  # 保存模型的状态字典
 
 
     # 在测试集上进行评估
@@ -213,42 +218,13 @@ def test(model, test_loader):
 
     # compare_routing_accuracy(model, data)
 
-# 使用 Dijkstra 算法进行所有节点到所有节点的路径预测
-def dijkstra_all_pairs(data):
-    num_nodes = data.x.size(0)
+# 加载并测试模型的函数
+def load_and_test_model(test_loader):
+    model = GNNRoutingModel(input_dim=3, hidden_dim=256)  # 创建与训练时相同的模型结构
+    model.load_state_dict(torch.load('./data/gnn_routing_model.pth'))  # 加载模型参数
+    print("模型加载成功，开始测试...")
+    test(model, test_loader)  # 调用测试函数
 
-    edge_index = data.edge_index  # 当前时间步的边索引，形状为 [2, 80]
-    edge_attr = data.edge_attr  # 当前时间步的边属性（权重），形状为 [80]
-
-    # 创建邻接表以表示图
-    adj_list = {i: [] for i in range(num_nodes)}
-    for i in range(edge_index.size(1)):
-        start_node = edge_index[0, i].item()
-        end_node = edge_index[1, i].item()
-        weight = edge_attr[i].item()
-        adj_list[start_node].append((end_node, weight))
-
-    # 使用 Dijkstra 计算所有节点对的最短路径跳数
-    all_hops = torch.full((num_nodes, num_nodes), float('inf'), dtype=torch.float)
-    for start_node in range(num_nodes):
-        visited = [False] * num_nodes
-        min_heap = [(0, start_node)]  # (距离, 节点)
-        all_hops[start_node, start_node] = 0
-
-        while min_heap:
-            current_hop, current_node = heapq.heappop(min_heap)
-            if visited[current_node]:
-                continue
-            visited[current_node] = True
-
-            for neighbor, _ in adj_list[current_node]:
-                if not visited[neighbor]:
-                    new_hop = current_hop + 1
-                    if new_hop < all_hops[start_node, neighbor]:
-                        all_hops[start_node, neighbor] = new_hop
-                        heapq.heappush(min_heap, (new_hop, neighbor))
-
-    return all_hops
 
 def dijkstra_all_pairs_with_paths_weighted(data):
     num_nodes = data.x.size(0)
@@ -293,57 +269,59 @@ def dijkstra_all_pairs_with_paths_weighted(data):
     return all_distances, all_paths
 
 
+
 # 比较 GNN 和 Dijkstra 的最短路径预测
 def predict_all_pairs_routing_with_cache(model, data):
     model.eval()
     path_cache = {}
+    hop_cache = {}  # 缓存跳数
     with torch.no_grad():
+        # 1. 获取通过GNN模型预测的跳数矩阵
         start_time_model = time.time()
-        hop_predictions = model(data).cpu()
-        hop_matrix = hop_predictions.squeeze()  # 尝试去掉不必要的维度
+        hop_matrix = model(data).cpu()
         end_time_model = time.time()
         print(f'神经网络加载所需时间: {end_time_model - start_time_model} 秒')
 
         start_time_for = time.time()
-        # 遍历所有目标节点和源节点
         num_nodes = hop_matrix.size(0)
+        # 2. 遍历所有节点对
         for target_node in range(num_nodes):
             for current_node in range(num_nodes):
-                # 如果缓存中已经有该路径，跳过计算
+                # 2.1 如果缓存中已经有该路径，跳过计算
                 if (current_node, target_node) in path_cache:
                     continue
-                # 路径初始化
-                path = [current_node]
-                visited = [False] * num_nodes  # 创建一个 visited 数组，跟踪已访问节点
-                visited[current_node] = True  # 当前节点标记为已访问
 
-                while current_node != target_node :
+                # 2.3 否则，初始化路径
+                path = [current_node]
+                while current_node != target_node:
                     neighbors = data.edge_index[1][data.edge_index[0] == current_node]
-                    # 如果当前节点直接与目标节点相连
+                    # 无向图，所以每一条边的方向都会被考虑两次
+                    neighbors = torch.unique(
+                        torch.cat([neighbors, data.edge_index[0][data.edge_index[1] == current_node]]))
+                    # 2.4 如果当前节点直接与目标节点相连
                     if target_node in neighbors:
                         path.append(target_node)
                         path_cache[(current_node, target_node)] = path
                         break
 
-                    # 计算与目标节点的跳数，选择跳数最小的邻居节点
+                    # 2.5 排除已经在 path 中的节点
+                    neighbors = [n for n in neighbors if n.item() not in path]
+                    # 2.6 计算与目标节点的跳数，选择跳数最小的邻居节点
                     hop_values = hop_matrix[target_node, neighbors]
 
-                    # 排除已经在路径中的节点
-                    valid_neighbors = [neighbor for neighbor in neighbors if not visited[neighbor]]
-                    valid_hop_values = hop_values[torch.tensor([neighbor in valid_neighbors for neighbor in neighbors])]
-
-                    if valid_neighbors:
-                        next_hop = valid_neighbors[torch.argmin(valid_hop_values)].item()
+                    if neighbors:
+                        next_hop = neighbors[torch.argmin(hop_values)].item()
                         path.append(next_hop)
-                        visited[next_hop] = True  # 标记该节点已访问
                         current_node = next_hop
                     else:
                         break  # 如果没有有效的邻居，退出循环
 
-                # 缓存路径中所有节点的计算路径和跳数
+                # 2.7 缓存路径中所有节点的计算路径和跳数
                 for i in range(len(path)):
                     if (path[i], target_node) not in path_cache:
                         path_cache[(path[i], target_node)] = path[i:]
+                    if (target_node, path[i]) not in path_cache:
+                        path_cache[(target_node, path[i])] = path[i:][::-1]
 
         end_time_for = time.time()
         print(f'bb计算所需时间: {end_time_for - start_time_for} 秒')
@@ -372,12 +350,8 @@ def compare_routing_accuracy(model, data):
 
     for start_node in range(num_nodes):
         for target_node in range(num_nodes):
-            path = dij_paths[start_node, target_node]
-
+            path = dij_paths[start_node][target_node]
             gnn_path = gnn_paths.get((start_node, target_node), None)
-                # 判断 GNN 预测的路径长度是否与 Dijkstra 一致
-                # if len(gnn_path) - 1 == dijkstra_hop_count:
-                #     correct_count += 1
             if path == gnn_path:
                 correct_count += 1
             total_count += 1
@@ -386,4 +360,17 @@ def compare_routing_accuracy(model, data):
     print(f'GNN 路径预测的准确度: {accuracy * 100:.2f}%')
 
 if __name__ == "__main__":
-    train_model()
+    # 检查是否存在训练好的模型文件
+    if os.path.exists('./data/gnn_routing_model.pth'):
+        print("发现已保存的模型，正在加载并进行测试...")
+        # 如果模型文件存在，加载并进行测试
+        test_loader = process_data_from_file('data/trimmed_data_test.csv')[1]  # 获取测试数据
+        load_and_test_model(test_loader)
+    else:
+        print("未找到已保存的模型，正在开始训练...")
+        # 如果模型文件不存在，开始训练
+        train_model()
+
+
+
+
