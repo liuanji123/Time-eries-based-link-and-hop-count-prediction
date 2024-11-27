@@ -146,7 +146,7 @@ def train_model():
     args = Args()
 
     # 构建时间序列数据集
-    train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_test.csv')
+    train_loader, test_loader, num_nodes = process_data_from_file('data/trimmed_data_all.csv')
     model = GNNRoutingModel(input_dim=args.input_size,
                             hidden_dim=args.hidden_size)
 
@@ -177,7 +177,7 @@ def train_model():
     plot_loss(losses)
 
     # 保存模型
-    torch.save(model.state_dict(), './data/gnn_routing_model.pth')  # 保存模型的状态字典
+    torch.save(model.state_dict(), './data/gnn_routing_model_all.pth')  # 保存模型的状态字典
 
 
     # 在测试集上进行评估
@@ -221,7 +221,7 @@ def test(model, test_loader):
 # 加载并测试模型的函数
 def load_and_test_model(test_loader):
     model = GNNRoutingModel(input_dim=3, hidden_dim=256)  # 创建与训练时相同的模型结构
-    model.load_state_dict(torch.load('./data/gnn_routing_model.pth'))  # 加载模型参数
+    model.load_state_dict(torch.load('./data/gnn_routing_model_all.pth'))  # 加载模型参数
     print("模型加载成功，开始测试...")
     test(model, test_loader)  # 调用测试函数
 
@@ -328,6 +328,25 @@ def predict_all_pairs_routing_with_cache(model, data):
     return path_cache
 
 
+# 计算路径的总边权重（即路径的距离）
+def calculate_path_distance(path, edge_attr, edge_index):
+    total_distance = 0
+    for i in range(len(path) - 1):
+        start_node = path[i]
+        end_node = path[i + 1]
+
+        # 查找边的索引并获取边的权重（假设边是无向图）
+        edge_mask = (edge_index[0] == start_node) & (edge_index[1] == end_node)
+        edge_index_selected = edge_index[:, edge_mask]
+        if edge_index_selected.size(1) == 0:
+            edge_mask = (edge_index[0] == end_node) & (edge_index[1] == start_node)
+            edge_index_selected = edge_index[:, edge_mask]
+
+        if edge_index_selected.size(1) > 0:
+            edge_weight = edge_attr[edge_index_selected[1]].item()  # 获取边的权重
+            total_distance += edge_weight
+
+    return total_distance
 
 # 比较 GNN 和 Dijkstra 的最短路径预测
 def compare_routing_accuracy(model, data):
@@ -339,29 +358,48 @@ def compare_routing_accuracy(model, data):
 
     # Dijkstra 路径预测
     start_time_dijkstra = time.time()
-    _, dij_paths = dijkstra_all_pairs_with_paths_weighted(data)
+    dij_dis, dij_paths = dijkstra_all_pairs_with_paths_weighted(data)
     end_time_dijkstra = time.time()
     print(f'Dijkstra 所有节点到所有节点路径预测时间: {end_time_dijkstra - start_time_dijkstra} 秒')
 
     # 比较路径预测的准确率
     correct_count = 0
+    correct_distance_count = 0
     total_count = 0
     num_nodes = data.x.size(0)
 
+    # 设定最大容忍的路径差异百分比
+    tolerance_percentage = 0.03  # 3%
+
     for start_node in range(num_nodes):
         for target_node in range(num_nodes):
+            # 获取 Dijkstra 和 GNN 的路径
+            gnn_path = gnn_paths.get((start_node, target_node), None)
+
+            # 计算 Dijkstra 路径的总距离
+            dij_path_distance = dij_dis[start_node, target_node]
+            # 计算 GNN 路径的总距离
+            gnn_path_distance = calculate_path_distance(gnn_path, data.edge_attr, data.edge_index)
+
             path = dij_paths[start_node][target_node]
             gnn_path = gnn_paths.get((start_node, target_node), None)
+            # 判断路径距离是否在容忍范围内（3%以内视为正确）
+            if abs(dij_path_distance - gnn_path_distance) / dij_path_distance <= tolerance_percentage:
+                correct_distance_count += 1
+
+            # 判断路径结构是否匹配
             if path == gnn_path:
                 correct_count += 1
             total_count += 1
 
     accuracy = correct_count / total_count if total_count > 0 else 0
+    distance_accuracy = correct_distance_count / total_count if total_count > 0 else 0
     print(f'GNN 路径预测的准确度: {accuracy * 100:.2f}%')
+    print(f'GNN 距离预测的准确度: {distance_accuracy * 100:.2f}%')
 
 if __name__ == "__main__":
     # 检查是否存在训练好的模型文件
-    if os.path.exists('./data/gnn_routing_model.pth'):
+    if os.path.exists('./data/gnn_routing_model_all.pth'):
         print("发现已保存的模型，正在加载并进行测试...")
         # 如果模型文件存在，加载并进行测试
         test_loader = process_data_from_file('data/trimmed_data_test.csv')[1]  # 获取测试数据
